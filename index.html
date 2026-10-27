@@ -141,6 +141,8 @@ input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; poin
         <button id="glassBtn" type="button" aria-expanded="false" aria-controls="gpick" title="時鐘數字和按鈕的玻璃：液態／凝態／霜態 × 亮／暗">玻璃：液態・亮</button>
         <button id="focusBtn" type="button" title="對焦在玻璃（背景失焦）或遠處（水滴失焦）">對焦：玻璃</button>
         <button id="tempBtn" type="button" title="室外氣溫：決定玻璃有多冷、會不會起霧">室外 12°C</button>
+        <button id="defogBtn" type="button" aria-pressed="false" title="暖風從窗下吹上來（像車子的除霧、窗下的暖氣）：從下面中間先清開">除霧</button>
+        <button id="coatBtn" type="button" aria-pressed="false" title="防霧塗層：凝結的水變成透明水膜，不會白；擦太多次會被擦掉">防霧塗層</button>
         <button id="fogBtn" type="button" title="室內濕度：決定玻璃裡面的霧、擦掉後多快回來">濕度 60%</button>
         <button id="recBtn" type="button" hidden><span class="dot"></span><span id="recLabel">存成影片</span></button>
         <button id="resetBg" type="button" hidden>原本的桌布</button>
@@ -210,6 +212,16 @@ class WetGlass {
     // 水路（Kaneda 1993）：滑過的地方已經濕了、接觸線不會被卡 → 後面的水滴優先走舊水路
     //   track = 濕過的記憶（約 40 秒才乾）；trails = 剛滑過留下的細水痕（一段段的細水柱，1~2 秒就變細、破成小水珠，Rio／Podgorski）
     this.track = new Float32Array(n); this.trails = []; this.time = 0;
+    // 冬天起霧的實拍（愛車褓母 EP12、俊辰說車 雨天前擋）：霧不是均勻的一片 → 一塊塊濃淡（玻璃各處冷熱、髒污、氣流不同），邊界很軟
+    //   patch：3~6 cm 的大塊雜訊（濃的地方先起霧、霧也比較白）
+    this.patch = new Float32Array(n);
+    { const ps = this.filmCell / 0.045;
+      for (let y = 0; y < this.fh; y++) for (let x = 0; x < this.fw; x++)
+        this.patch[y * this.fw + x] = clamp01(0.5 + 0.95 * (vnoise(ox * 5 + x * ps, oy * 5 + y * ps) - 0.5) + 0.5 * (vnoise(ox * 7 + x * ps * 2.7, oy * 7 + y * ps * 2.7) - 0.5)); }
+    // 除霧（車子的除霧、窗下的暖氣）：暖風從下緣中間吹上來 → 局部把玻璃加熱 warm（°C）、空氣也比較乾
+    this.warm = new Float32Array(n); this.defogOn = false;
+    // 防霧塗層（親水）：凝結的水攤成一層透明的水膜、不會白；擦太多次會被擦掉（防霧劑說明：「請勿過度重複擦拭」）
+    this.coat = new Float32Array(n); this.fogFilm = new Float32Array(n);
     const vs = this.filmCell / 0.03;
     for (let y = 0; y < this.fh; y++) for (let x = 0; x < this.fw; x++)
       this.fvar[y * this.fw + x] = 0.45 + 1.1 * vnoise(ox * 3 + x * vs, oy * 3 + y * vs) + 0.25 * (vnoise(ox + x * vs * 4, oy + y * vs * 4) - 0.5);
@@ -256,26 +268,49 @@ class WetGlass {
     }
   }
   fogSat(y) { return -1.0 * Math.log(1 - Math.min(this.fogTarget(y), 0.95)); }                    // 霧長到這個水量就不再變白（水珠開始合併變大）
+  // 一格的霧最後會多濃：冷凝速度 J 決定（同 updateFogLevel）× 下緣比較厚 × 這一塊玻璃比較容易起霧（patch）
+  fogSatCell(i, v, J) {
+    const fl = J > 0 ? 0.9 * (1 - Math.exp(-J / 0.009)) : 0;
+    return -Math.log(1 - Math.min(0.95, fl * (0.8 + 0.2 * (1 - v) * (1 - v)) * (0.72 + 0.56 * this.patch[i])));
+  }
+  setCoat(on) { this.coat.fill(on ? 1 : 0); }
   initFog() {
-    const c0 = this.condFlux() > 0 ? Math.min(12, this.condFlux() * 600) : 0;   // 起霧約 10 分鐘的水量（濕度 75% ≈ 5 g/m²）
-    for (let y = 0; y < this.fh; y++) { const m = this.fogSat(y); for (let x = 0; x < this.fw; x++) { const i = y * this.fw + x; this.fogM[i] = m; this.fog[i] = 1 - Math.exp(-m / 1.0); this.cond[i] = m > 0 ? c0 * (0.7 + 0.6 * this.fvar[i] / 1.8) : 0; } }
+    const J = this.condFlux(), c0 = J > 0 ? Math.min(12, J * 600) : 0;   // 起霧約 10 分鐘的水量（濕度 75% ≈ 5 g/m²）
+    for (let y = 0; y < this.fh; y++) for (let x = 0; x < this.fw; x++) {
+      const i = y * this.fw + x, m = this.fogSatCell(i, y / this.fh, J), fv = 1 - Math.exp(-m / 1.0);
+      this.fogM[i] = m; this.fog[i] = fv * (1 - this.coat[i]); this.fogFilm[i] = fv * this.coat[i]; this.cond[i] = m > 0 ? c0 * (0.7 + 0.6 * this.fvar[i] / 1.8) : 0;
+    }
   }
   stepFog(dt) {
     this.updateFogLevel(); this.stepIce(dt);
     const J = this.condFlux(), ko = Math.exp(-dt / 1800), kr = Math.exp(-dt / (this.rainNow > 0.05 ? 5 : 2.5));   // 指紋細紋：約 650 nm 的水膜 3 秒就乾（雨天濕度高、慢一點）
+    const air = this.rh * WetGlass.rhoSat(this.Tin), dOn = this.defogOn, fw = this.fw;
     for (let y = 0; y < this.fh; y++) {
-      const mS = this.fogSat(y);
-      for (let x = 0; x < this.fw; x++) {
-        const i = y * this.fw + x; let m = this.fogM[i];
-        if (J > 0 && m < mS) m = Math.min(mS, m + J * dt);               // 擦掉後：水量照冷凝速度線性長回來（breath figure 前期）
+      const v = y / this.fh;
+      for (let x = 0; x < fw; x++) {
+        const i = y * fw + x; let m = this.fogM[i], Ji = J, pt = this.patch[i];
+        // 除霧：噴口在下緣中間 → 下面先熱、往上往兩邊擴開；每一塊熱起來的快慢不同 → 清出來的是拱形、邊緣不規則（實拍：前擋從下面中間先清開）
+        if (dOn || this.warm[i] > 0.02) {
+          const u = (x + 0.5) / fw - 0.5, reach = Math.exp(-u * u / (0.06 + 0.2 * v)) * Math.exp(-1.3 * v);
+          const tgt = dOn ? 16 * reach : 0, tau = dOn ? (6 + 50 * v) * (0.5 + pt) : 45;
+          const w = this.warm[i] += (tgt - this.warm[i]) * Math.min(1, dt / tau);
+          // 玻璃變熱、吹來的空氣比較乾 → 霧蒸發；吹風（強制對流，風速幾 m/s）時質量傳遞係數比自然對流（2.5 mm/s）大約 10 倍
+          //   除霧的風是除濕過的（車子會開 A/C；暖氣把空氣加熱、絕對濕度不變但吹到的地方會被換成比較乾的空氣）→ 只會加快蒸發，不會加快起霧
+          Ji = 2.5e-3 * (air * (1 - (dOn ? 0.6 * Math.min(1, 2 * reach) : 0)) - WetGlass.rhoSat(this.Tg + w));
+          if (Ji < 0 && dOn) Ji *= 1 + 9 * reach;
+        }
+        const mS = this.fogSatCell(i, v, Ji);
+        if (Ji > 0 && m < mS) m = Math.min(mS, m + Ji * dt * (0.6 + 0.8 * pt));   // 擦掉後：照冷凝速度長回來；容易起霧的那幾塊先白
         else if (m > mS) m += (mS - m) * Math.min(1, dt / 60);          // 濕度調低：慢慢退到新的濃度
-        if (J < 0) m = Math.max(0, m + J * dt);                           // 低於露點：蒸發
+        if (Ji < 0) m = Math.max(0, m + Ji * dt);                         // 低於露點：蒸發
         this.fogM[i] = m;
-        this.cond[i] = Math.max(0, Math.min(12, this.cond[i] + J * dt));
+        this.cond[i] = Math.max(0, Math.min(12, this.cond[i] + Ji * dt));
         this.oil[i] *= ko; this.resid[i] *= kr;
-        this.fog[i] = (1 - Math.exp(-m / 1.0)) * (1 - 0.45 * this.oil[i]);
+        const fv = (1 - Math.exp(-m / 1.0)) * (1 - 0.45 * this.oil[i]);
+        this.fog[i] = fv * (1 - this.coat[i]); this.fogFilm[i] = fv * this.coat[i];
       }
     }
+    this.anyWarm = dOn || this.warm.some(w => w > 0.02);
   }
   fIdx(x, y) { return Math.min(this.fh - 1, Math.max(0, (y / this.filmCell) | 0)) * this.fw + Math.min(this.fw - 1, Math.max(0, (x / this.filmCell) | 0)); }
   filmAt(x, y) { return this.film[this.fIdx(x, y)]; }
@@ -385,6 +420,7 @@ class WetGlass {
         this.resid[i] = 0.75 + 0.25 * Math.random(); this.wdir[i] = ang;   // 指紋的細紋（極薄的水膜，幾秒就乾）
         cond += this.cond[i]; this.cond[i] = 0;    // 霧裡的水
         if (this.frostP > 0) { this.frostMask[i] = 0; this.maskLow = true; }   // 冰花被刮掉
+        this.coat[i] *= 0.82;                      // 防霧塗層被擦薄（擦很多次的地方又會起白霧）
         this.fogM[i] = 0; this.fog[i] = 0;
         const fall = 1 - Math.sqrt((x - fx) ** 2 + (y - fy) ** 2) / (rc + 0.5);
         this.oil[i] = Math.max(this.oil[i], 0.5 + 0.4 * fall + 0.1 * Math.random());
@@ -885,7 +921,17 @@ void main(){
   }
   // 起霧（玻璃裡面的凝結）：乳白、往局部平均提亮（Pilon 2021：小接觸角的霧往前散、幾乎不損失光）
   vec3 l2 = texture(uL2, uv).rgb, l3 = texture(uL3, uv).rgb;
-  vec3 fogCol = mix(mix(l2, l3, 0.5), vec3(lum(l3)), 0.3) + (0.03 + lum(l3) * 0.45) * 0.4;
+  // 霧珠把光往四面八方散：看到的是一大片周圍光的平均（l3），再加上室內的光被霧打回來（白天、夜裡都有一層灰白）
+  //   實拍（俊辰說車 前擋）：深色的樹 0.3 → 起霧後約 0.65、天空 0.85 幾乎不變 → 暗處被提亮很多、顏色變淡、偏一點冷色
+  vec3 fogCol = mix(l3, vec3(lum(l3)), 0.4) * 0.78 * vec3(0.97, 0.99, 1.03) + 0.15 + 0.14 * lum(l3);
+  // 防霧塗層：親水 → 凝結的水攤成一層連續的薄水膜（不散射、透明），只有厚薄不均的地方稍微扭曲
+  {
+    float film = texture(uFrostMask, uv).g;
+    vec2 fp = uv * vec2(55.0, 55.0 * uAspect);
+    vec2 fwob = vec2(vn(fp) - 0.5, vn(fp + 7.3) - 0.5) * 0.004 * film;
+    vec3 fc = texture(uScene, uv + off + fwob).rgb;
+    col = mix(col, fc * 0.97 + 0.02, film * 0.9);
+  }
   // 零下：霧珠變成冰（過冷的霧珠被冰橋一顆接一顆凍住，Dooley 2010／Paulovics 2022）
   //   冰的飽和水氣比水低 → 冰花旁邊的霧珠蒸發、水氣跑到冰上（冰花四周一圈乾淨的玻璃）；冰花越長，霧被吃掉越多
   if (uIceIn > 0.0) {
@@ -1180,9 +1226,9 @@ function newGlass() {
   //   → 框住 9.1 cm（×1.3）：水滴的物理大小不變，在畫面上小 1.3 倍（1.6 倍時比 119012 小）
   glassW = 0.07 * VIEW_K; glassH = glassW * (rect.height / Math.max(1, rect.width));
   glass = new WetGlass(glassW, glassH);
-  glass.rh = FOG_LEVELS[fogIdx].rh; glass.Tout = TEMPS[tempIdx]; glass.updateFogLevel(); glass.fog.fill(0); glass.initFog();
+  glass.rh = FOG_LEVELS[fogIdx].rh; glass.Tout = TEMPS[tempIdx]; glass.defogOn = defogOn; glass.setCoat(coatOn); glass.updateFogLevel(); glass.fog.fill(0); glass.initFog();
   // 一開始玻璃是乾的（使用者：「一開始是沒有雨在玻璃上的狀態」）→ 雨打上來才慢慢累積
-  wetBytes = new Uint8Array(glass.fw * glass.fh * 4); maskBytes = new Uint8Array(glass.fw * glass.fh * 4).fill(255);
+  wetBytes = new Uint8Array(glass.fw * glass.fh * 4); maskBytes = new Uint8Array(glass.fw * glass.fh * 4).fill(255); for (let i = 1; i < maskBytes.length; i += 4) maskBytes[i] = 0;
   gl.bindTexture(gl.TEXTURE_2D, frostMaskTex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, glass.fw, glass.fh, 0, gl.RGBA, gl.UNSIGNED_BYTE, maskBytes);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -1511,8 +1557,8 @@ function render(t, dt, rain) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.generateMipmap(gl.TEXTURE_2D); frostRes = [cv.width, cv.height];
   }
-  if (glass.frostP > 0) {
-    const M = glass.frostMask; for (let i = 0; i < M.length; i++) maskBytes[i * 4] = Math.round(255 * M[i]);
+  {
+    const M = glass.frostMask, FF = glass.fogFilm; for (let i = 0; i < M.length; i++) { maskBytes[i * 4] = Math.round(255 * M[i]); maskBytes[i * 4 + 1] = Math.round(255 * clamp01(FF[i])); }
     gl.bindTexture(gl.TEXTURE_2D, frostMaskTex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, glass.fw, glass.fh, gl.RGBA, gl.UNSIGNED_BYTE, maskBytes);
   }
   // ---- 4. 合成 ----
@@ -1585,6 +1631,7 @@ let fogIdx = 0;
 const TEMPS = [12, 5, 0, -5, -10, -20, 20, 28];   // 室外氣溫（°C）：預設 12°C（秋天的雨）；單層玻璃、室溫 22°C 時，室外約 −7°C 以下玻璃才會到零下
 const degC = v => `${v < -0.5 ? "−" : ""}${Math.abs(Math.round(v))}°C`;
 let tempIdx = 0;
+let defogOn = false, coatOn = false;   // 除霧、防霧塗層
 // 時鐘玻璃：實心（原本的白字）／液態／凝態／霜態（參考小紅書 Next Vision 的三種玻璃）
 const CLOCK_GLASS = [{ kind: 1, label: "液態玻璃" }, { kind: 2, label: "凝態玻璃" }, { kind: 3, label: "霜態玻璃" }, { kind: 0, label: "實心" }];
 let clockGlassIdx = 0, glassTone = 0;   // 亮版／暗版（參考圖 1/2、2/2）
@@ -1620,6 +1667,8 @@ function showUI() { $("bar").classList.remove("hide"); clearTimeout(uiTimer); ui
 $("weather").addEventListener("click", () => { modeIdx = (modeIdx + 1) % MODES.length; $("weatherLabel").textContent = MODES[modeIdx].label; if (MODES[modeIdx].key === "video") { weatherT = 0; newGlass(); } showUI(); });
 $("focusBtn").addEventListener("click", () => { focus.target = focus.target > 0.5 ? 0 : 1; $("focusBtn").textContent = focus.target > 0.5 ? "對焦：玻璃" : "對焦：遠處"; showUI(); });
 $("tempBtn").addEventListener("click", () => { tempIdx = (tempIdx + 1) % TEMPS.length; glass.Tout = TEMPS[tempIdx]; $("tempBtn").textContent = `室外 ${degC(TEMPS[tempIdx])}`; showUI(); });
+$("defogBtn").addEventListener("click", () => { defogOn = !defogOn; glass.defogOn = defogOn; $("defogBtn").setAttribute("aria-pressed", String(defogOn)); showUI(); });
+$("coatBtn").addEventListener("click", () => { coatOn = !coatOn; glass.setCoat(coatOn); $("coatBtn").setAttribute("aria-pressed", String(coatOn)); showUI(); });
 $("fogBtn").addEventListener("click", () => { fogIdx = (fogIdx + 1) % FOG_LEVELS.length; glass.rh = FOG_LEVELS[fogIdx].rh; $("fogBtn").textContent = FOG_LEVELS[fogIdx].label; showUI(); });
 $("glassBtn").addEventListener("click", () => { pickerOpen($("gpick").hidden); showUI(); });
 $("gpick").addEventListener("click", e => {
@@ -1697,7 +1746,7 @@ function frame(now) {
   focus.cur += Math.sign(focus.target - focus.cur) * Math.min(Math.abs(focus.target - focus.cur), dt / 3.5);
   render(now / 1000, dt, rain);
   const tg = glass.glassTemp(), td = glass.dewPoint();
-  const line2 = tg < 0 ? `玻璃 ${degC(tg)}・${td > 0 ? "露點 " + degC(td) : "霜點 " + degC(glass.frostPoint())}・結霜（冰花約加快 30 倍長）` : `玻璃 ${degC(tg)}・露點 ${degC(td)}・${tg < td ? "起霧" : "不起霧"}`;
+  const line2 = tg < 0 ? `玻璃 ${degC(tg)}・${td > 0 ? "露點 " + degC(td) : "霜點 " + degC(glass.frostPoint())}・結霜（冰花約加快 30 倍長）` : `玻璃 ${degC(tg)}・露點 ${degC(td)}・${tg < td ? "起霧" : "不起霧"}${glass.defogOn ? "・除霧中（暖風從下面吹）" : ""}`;
   if (!recording) $("status").innerHTML = `<b>${name}</b>${note ? "・" + note : ""}<br>${line2}`;   // 看得出為什麼起霧
   requestAnimationFrame(frame);
 }
