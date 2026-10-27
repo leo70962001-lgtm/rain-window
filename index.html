@@ -141,8 +141,6 @@ input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; poin
         <button id="glassBtn" type="button" aria-expanded="false" aria-controls="gpick" title="時鐘數字和按鈕的玻璃：液態／凝態／霜態 × 亮／暗">玻璃：液態・亮</button>
         <button id="focusBtn" type="button" title="對焦在玻璃（背景失焦）或遠處（水滴失焦）">對焦：玻璃</button>
         <button id="tempBtn" type="button" title="室外氣溫：決定玻璃有多冷、會不會起霧">室外 12°C</button>
-        <button id="defogBtn" type="button" aria-pressed="false" title="暖風從窗下吹上來（像車子的除霧、窗下的暖氣）：從下面中間先清開">除霧</button>
-        <button id="coatBtn" type="button" aria-pressed="false" title="防霧塗層：凝結的水變成透明水膜，不會白；擦太多次會被擦掉">防霧塗層</button>
         <button id="fogBtn" type="button" title="室內濕度：決定玻璃裡面的霧、擦掉後多快回來">濕度 60%</button>
         <button id="recBtn" type="button" hidden><span class="dot"></span><span id="recLabel">存成影片</span></button>
         <button id="resetBg" type="button" hidden>原本的桌布</button>
@@ -1631,7 +1629,7 @@ let fogIdx = 0;
 const TEMPS = [12, 5, 0, -5, -10, -20, 20, 28];   // 室外氣溫（°C）：預設 12°C（秋天的雨）；單層玻璃、室溫 22°C 時，室外約 −7°C 以下玻璃才會到零下
 const degC = v => `${v < -0.5 ? "−" : ""}${Math.abs(Math.round(v))}°C`;
 let tempIdx = 0;
-let defogOn = false, coatOn = false;   // 除霧、防霧塗層
+let defogOn = false, coatOn = false;   // 除霧、防霧塗層（模擬還在，按鈕拿掉了：使用者「這2個不需要」）
 // 時鐘玻璃：實心（原本的白字）／液態／凝態／霜態（參考小紅書 Next Vision 的三種玻璃）
 const CLOCK_GLASS = [{ kind: 1, label: "液態玻璃" }, { kind: 2, label: "凝態玻璃" }, { kind: 3, label: "霜態玻璃" }, { kind: 0, label: "實心" }];
 let clockGlassIdx = 0, glassTone = 0;   // 亮版／暗版（參考圖 1/2、2/2）
@@ -1667,8 +1665,6 @@ function showUI() { $("bar").classList.remove("hide"); clearTimeout(uiTimer); ui
 $("weather").addEventListener("click", () => { modeIdx = (modeIdx + 1) % MODES.length; $("weatherLabel").textContent = MODES[modeIdx].label; if (MODES[modeIdx].key === "video") { weatherT = 0; newGlass(); } showUI(); });
 $("focusBtn").addEventListener("click", () => { focus.target = focus.target > 0.5 ? 0 : 1; $("focusBtn").textContent = focus.target > 0.5 ? "對焦：玻璃" : "對焦：遠處"; showUI(); });
 $("tempBtn").addEventListener("click", () => { tempIdx = (tempIdx + 1) % TEMPS.length; glass.Tout = TEMPS[tempIdx]; $("tempBtn").textContent = `室外 ${degC(TEMPS[tempIdx])}`; showUI(); });
-$("defogBtn").addEventListener("click", () => { defogOn = !defogOn; glass.defogOn = defogOn; $("defogBtn").setAttribute("aria-pressed", String(defogOn)); showUI(); });
-$("coatBtn").addEventListener("click", () => { coatOn = !coatOn; glass.setCoat(coatOn); $("coatBtn").setAttribute("aria-pressed", String(coatOn)); showUI(); });
 $("fogBtn").addEventListener("click", () => { fogIdx = (fogIdx + 1) % FOG_LEVELS.length; glass.rh = FOG_LEVELS[fogIdx].rh; $("fogBtn").textContent = FOG_LEVELS[fogIdx].label; showUI(); });
 $("glassBtn").addEventListener("click", () => { pickerOpen($("gpick").hidden); showUI(); });
 $("gpick").addEventListener("click", e => {
