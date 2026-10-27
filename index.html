@@ -204,6 +204,9 @@ class WetGlass {
     this.resid = new Float32Array(n); this.wdir = new Float32Array(n);
     // 玻璃內側凝結的水（g/m²）：霧的濃度很快就飽和，但水會一直凝結（J·時間）→ 擦的時候推出來的就是這些水
     this.cond = new Float32Array(n);
+    // 結冰（室外零下）：單層玻璃內外差不到 0.1°C → 兩面一樣冷
+    //   frostP：裡面的冰花長到哪（圖案時間，秒）；iceOut：外面的水滴凍住多少（0~1）；frostMask：擦掉的地方（0）→ 從邊緣慢慢長回來
+    this.frostP = 0; this.iceOut = 0; this.frostMask = new Float32Array(n).fill(1); this.maskLow = false;
     // 水路（Kaneda 1993）：滑過的地方已經濕了、接觸線不會被卡 → 後面的水滴優先走舊水路
     //   track = 濕過的記憶（約 40 秒才乾）；trails = 剛滑過留下的細水痕（一段段的細水柱，1~2 秒就變細、破成小水珠，Rio／Podgorski）
     this.track = new Float32Array(n); this.trails = []; this.time = 0;
@@ -226,13 +229,39 @@ class WetGlass {
   // 霧的濃度也由冷凝速度決定（濕度 75%、玻璃 10°C ≈ 0.6；濕度 60% ≈ 0.2）
   updateFogLevel() { this.Tg = this.glassTemp(); const J = this.condFlux(); this.fogLevel = J > 0 ? 0.9 * (1 - Math.exp(-J / 0.009)) : 0; }
   condFlux() { return 2.5e-3 * (this.rh * WetGlass.rhoSat(this.Tin) - WetGlass.rhoSat(this.Tg)); }   // g/m²/s；負的 = 空氣比較乾、霧在蒸發
+  // 冰面上的飽和水氣（Magnus，冰：22.46、272.62，−65~0°C）→ 霜點、往冰面的凝華速度（跟霧一樣 hm ≈ 2.5 mm/s）
+  static rhoIce(T) { return 6.112 * Math.exp(22.46 * T / (272.62 + T)) * 100 / (461.5 * (T + 273.15)) * 1000; }
+  frostPoint() { const l = Math.log(this.rh * 6.112 * Math.exp(17.62 * this.Tin / (243.12 + this.Tin)) / 6.112); return 272.62 * l / (22.46 - l); }
+  iceFlux() { return 2.5e-3 * (this.rh * WetGlass.rhoSat(this.Tin) - WetGlass.rhoIce(this.Tg)); }
+  stepIce(dt) {
+    const Tg = this.Tg;
+    if (Tg < 0) {
+      // 外面：雨滴是過冷的，一碰到零下的玻璃就從底部開始凍（接觸線馬上卡住），整顆凍透要幾秒（越冷越快）
+      this.iceOut = Math.min(1, this.iceOut + dt * -Tg / 40);
+      // 裡面：冰花的生長速度 ∝ 凝華的水氣量（玻璃 −2.5°C、濕度 60% 時 = 1）；實際要幾十分鐘～幾小時，畫面上約加快 30 倍
+      this.frostP += dt * Math.max(0, this.iceFlux()) / 0.019;
+    } else {
+      this.iceOut = Math.max(0, this.iceOut - dt * Math.max(0.3, Tg) / 30);
+      this.frostP = Math.max(0, this.frostP - dt * (1 + Tg) * 2);   // 回溫：最細的冰針先融
+    }
+    if (this.maskLow) {   // 擦掉的地方：冰從擦痕的邊緣往裡面長回來（＋一點點新的成核）
+      const fw = this.fw, fh = this.fh, M = this.frostMask, G = Tg < 0 ? Math.min(3, Math.max(0.3, this.iceFlux() / 0.019)) : 0;
+      const k = Math.min(1, dt * 0.25 * G), grow = dt * 0.002 * G; let any = false;
+      for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) {
+        const i = y * fw + x; if (M[i] >= 1) continue; any = true;
+        const nb = Math.max(x > 0 ? M[i - 1] : 1, x < fw - 1 ? M[i + 1] : 1, y > 0 ? M[i - fw] : 1, y < fh - 1 ? M[i + fw] : 1);
+        M[i] = Math.min(1, M[i] + Math.max(0, nb - M[i]) * k + grow);
+      }
+      this.maskLow = any;
+    }
+  }
   fogSat(y) { return -1.0 * Math.log(1 - Math.min(this.fogTarget(y), 0.95)); }                    // 霧長到這個水量就不再變白（水珠開始合併變大）
   initFog() {
     const c0 = this.condFlux() > 0 ? Math.min(12, this.condFlux() * 600) : 0;   // 起霧約 10 分鐘的水量（濕度 75% ≈ 5 g/m²）
     for (let y = 0; y < this.fh; y++) { const m = this.fogSat(y); for (let x = 0; x < this.fw; x++) { const i = y * this.fw + x; this.fogM[i] = m; this.fog[i] = 1 - Math.exp(-m / 1.0); this.cond[i] = m > 0 ? c0 * (0.7 + 0.6 * this.fvar[i] / 1.8) : 0; } }
   }
   stepFog(dt) {
-    this.updateFogLevel();
+    this.updateFogLevel(); this.stepIce(dt);
     const J = this.condFlux(), ko = Math.exp(-dt / 1800), kr = Math.exp(-dt / (this.rainNow > 0.05 ? 5 : 2.5));   // 指紋細紋：約 650 nm 的水膜 3 秒就乾（雨天濕度高、慢一點）
     for (let y = 0; y < this.fh; y++) {
       const mS = this.fogSat(y);
@@ -285,7 +314,7 @@ class WetGlass {
     const vol = V3(r);
     // 打在水膜上：先是一顆看得到的水滴，約 0.5~1.5 秒後才融進水膜（實拍：大雨時水膜上一直有新的水滴）
     const hit = this.overlap(x, y, r, -1);
-    if (hit >= 0) { const o = this.drops[hit], nv = o.vol + vol; if (!o.moving) { o.x = (o.x * o.vol + x * vol) / nv; o.y = (o.y * o.vol + y * vol) / nv; } o.vol = nv; return; }
+    if (hit >= 0) { const o = this.drops[hit], nv = o.vol + vol; this.wobble(o, x - o.x, y - o.y, vol / nv); if (!o.moving) { o.x = (o.x * o.vol + x * vol) / nv; o.y = (o.y * o.vol + y * vol) / nv; } o.vol = nv; return; }
     const d = this.newDrop(x, y, vol);
     if (this.drops.length >= this.maxDrops) {
       let k = (Math.random() * this.drops.length) | 0;
@@ -307,6 +336,14 @@ class WetGlass {
       this.impact(x + Math.cos(a) * d, y + Math.sin(a) * d, Math.min(0.0006, Math.cbrt(each)));
     }
   }
+  // 水碰到水（Narhe, Beysens & Nikolayev 2004：合併後的水滴先沿合併方向被拉長，約 0.1~0.3 秒指數縮回平衡；
+  //   高速攝影裡合併時會劇烈晃動，晃動幫接觸線鬆開 → 本來快到臨界的水滴被合併「推」一下就滑下去）
+  //   ratio = 小的那顆佔合併後的比例：毛毛雨落在大水滴上（< 4%）幾乎看不出來
+  wobble(d, ax, ay, ratio) {
+    if (ratio < 0.04 || d.moving || this.iceOut > 0.02) return;
+    d.wob = 0.25; d.wa = Math.atan2(ay, ax); d.we = Math.min(1, 1.6 * ratio);
+    d.kick = Math.max(d.kick || 0, 0.15); d.kickD = 0.62 + 0.22 * Math.random();
+  }
   seed(n, r0, r1) { this.buildGrid(); for (let i = 0; i < n; i++) { const u = Math.random(); this.impact(Math.random() * this.W, Math.random() * this.H, r0 + (r1 - r0) * u * u); } }   // 小的多、大的少
 
   // 手指擦過：路上的水滴被推開（堆到兩旁變成大水滴），留下一層薄水膜，0.3~1.5 秒後破成小水珠
@@ -319,12 +356,22 @@ class WetGlass {
     const nx = -sy / len, ny = sx / len, ang = ((Math.atan2(sy, sx) % Math.PI) + Math.PI) % Math.PI;
     const low = ny < 0 ? 1 : -1;                                 // 擦痕的下緣在哪一邊（水往下聚）
     let removed = 0;
-    for (const d of this.drops) {
+    const iced = this.iceOut > 0.5;                              // 凍住的水滴黏在玻璃上，擦不掉
+    if (!iced) for (const d of this.drops) {
       if (d.vol <= 0) continue;
       const t = clamp01(((d.x - ax) * sx + (d.y - ay) * sy) / L2);
-      const qx = ax + sx * t - d.x, qy = ay + sy * t - d.y;
-      if (qx * qx + qy * qy < (rad + R3(d.vol) * 0.5) ** 2) { removed += d.vol; d.vol = 0; }
+      const qx = ax + sx * t - d.x, qy = ay + sy * t - d.y, dist = Math.sqrt(qx * qx + qy * qy), r = R3(d.vol);
+      if (dist < rad * 0.75) { removed += d.vol; d.vol = 0; }
+      else if (dist < rad + r * 0.8) {                          // 擦痕邊上：被手指邊的水堤推出去，晃一下（可能因此滑下去）
+        const ux = -qx / Math.max(dist, 1e-6), uy = -qy / Math.max(dist, 1e-6), push = rad + r * 0.9 - dist;
+        d.x += ux * push; d.y += uy * push; d.moving = false;
+        this.wobble(d, ux, uy, 0.5);
+      }
     }
+    // 手指前面推著一團水（水堤）：每一段留一點在手指前緣，撞到前面的水滴就合併；放開手指時剩下的留在原地（wipeEnd）
+    this.carry = (this.carry || 0) + removed * 0.3;
+    const dep = this.carry * 0.25;
+    if (dep > V3(0.0002)) { this.carry -= dep; this.impact(bx + sx / len * rad * 0.95, by + sy / len * rad * 0.95, R3(dep)); }
     const steps = Math.max(1, Math.ceil(len / (this.filmCell * 0.7))), rc = Math.ceil(rad / this.filmCell);
     let cond = 0;
     for (let s = 0; s <= steps; s++) {
@@ -337,6 +384,7 @@ class WetGlass {
         this.film[i] *= 0.2;                       // 外面的水膜被抹掉
         this.resid[i] = 0.75 + 0.25 * Math.random(); this.wdir[i] = ang;   // 指紋的細紋（極薄的水膜，幾秒就乾）
         cond += this.cond[i]; this.cond[i] = 0;    // 霧裡的水
+        if (this.frostP > 0) { this.frostMask[i] = 0; this.maskLow = true; }   // 冰花被刮掉
         this.fogM[i] = 0; this.fog[i] = 0;
         const fall = 1 - Math.sqrt((x - fx) ** 2 + (y - fy) ** 2) / (rc + 0.5);
         this.oil[i] = Math.max(this.oil[i], 0.5 + 0.4 * fall + 0.1 * Math.random());
@@ -344,7 +392,7 @@ class WetGlass {
       this.micro[this.cell(cx, cy)] = 0;
     }
     // 霧裡的水（玻璃內側）：0.35 被推到邊緣 → 下緣多（70%）；小水珠排成水堤，下緣再聚成一顆大的（夠大就流下來、在霧上劃出水道）
-    this.pushV += cond * this.filmCell * this.filmCell * 1e-6 / 4.19 * 0.35;
+    if (this.Tg >= 0) this.pushV += cond * this.filmCell * this.filmCell * 1e-6 / 4.19 * 0.35;   // 零下：刮下來的是冰屑，不會聚成水珠流下來
     let guard = 0;
     while (this.pushV > V3(0.00025) && this.drops.length < this.maxDrops && guard++ < 60) {
       const bank = Math.random() < 0.55, side = bank ? (Math.random() < 0.7 ? low : -low) : low;
@@ -353,18 +401,23 @@ class WetGlass {
       this.pushV -= V3(r);
       if (x > 0 && y > 0 && x < this.W && y < this.H) this.drops.push(this.newDrop(x, y, V3(r), true));
     }
-    // 外面的雨水：0.35 推到兩邊（大多在下緣），排成 0.3~0.9 mm 的水珠
-    let v = removed * 0.35; guard = 0;
-    while (v > V3(0.00025) && this.drops.length < this.maxDrops && guard++ < 40) {
+    // 外面的雨水：一半推到兩邊（大多在下緣），排成 0.3~0.9 mm 的水珠；碰到旁邊原本的水滴就合併（水碰到水 → 變大、晃一下、可能滑下去）
+    let v = removed * 0.45; guard = 0;
+    while (v > V3(0.00025) && guard++ < 40) {
       const r = Math.min(R3(v), 0.0003 + Math.random() * 0.0006), t = Math.random(), side = Math.random() < 0.7 ? low : -low;
       const x = ax + sx * t + nx * rad * 1.05 * side, y = ay + sy * t + ny * rad * 1.05 * side;
       v -= V3(r);
-      if (x > 0 && y > 0 && x < this.W && y < this.H) this.drops.push(this.newDrop(x, y, V3(r)));
+      this.impact(x, y, r);
     }
+  }
+  wipeEnd(x, y) {   // 手指放開：推著的那團水留在指尖（夠大就流下來）
+    if ((this.carry || 0) > V3(0.0002) && this.iceOut <= 0.5) this.impact(x, y, R3(this.carry));
+    this.carry = 0;
   }
 
   step(dt, rain) {
     this.rainNow = rain;
+    const frozen = this.iceOut > 0.02;   // 零下：水滴從底部凍住 → 不會滑、不會合併
     this.buildGrid();
     const gx = 0, gy = -1, sideX = 1, sideY = 0;   // 手機直拿：重力往下
     // 1. 看得到的雨滴打上來
@@ -377,7 +430,9 @@ class WetGlass {
     for (let i = 0; i < D.length; i++) {
       const d = D[i]; if (d.vol <= 0) continue;
       if (d.kick > 0 && !d.moving) d.kick -= dt;
+      if (d.wob > 0) d.wob -= dt;
       const r = R3(d.vol);
+      if (frozen) { d.moving = false; d.v = 0; continue; }
       if (!d.moving) {
         d.px = d.x; d.py = d.y;
         const fi0 = this.fIdx(d.x, d.y);
@@ -416,7 +471,7 @@ class WetGlass {
         if (this.filmAt(bx, by) > this.wetTh) this.addFilm(bx, by, this.volToFilm(bv));
         else if (D.length < this.maxDrops) { const nb = this.newDrop(bx, by, bv); nb.bead = true; D.push(nb); }   // 留在水路上的小水珠：不會被水路吸掉
       }
-      const hit = this.overlap(d.x, d.y, r, i);
+      const hit = this.overlap(d.x, d.y, r * 1.35, i);   // 滑下來的水滴前面有一圈水膜（彎月面）：旁邊差一點點碰到的也會被吸進來（水碰到水）
       if (hit >= 0 && hit !== i) {
         const o = D[hit], nv = d.vol + o.vol;
         d.x = (d.x * d.vol + o.x * o.vol) / nv; d.y = Math.min(d.y, o.y);   // 不會被往上拉
@@ -449,10 +504,11 @@ class WetGlass {
       // 靜止的水滴長大後碰到隔壁 → 合併（breath figure：合併空出來的地方再冒出新的小水珠 → 大小分布很寬，有大有小、有空隙）
       this.buildGrid();
       for (let i = 0; i < D.length; i++) {
-        const d = D[i]; if (d.vol <= 0 || d.moving) continue;
+        const d = D[i]; if (d.vol <= 0 || d.moving || frozen) continue;
         const j = this.overlap(d.x, d.y, R3(d.vol), i); if (j < 0) continue;
         const o = D[j]; if (o.vol <= 0) continue;
         const big = d.vol >= o.vol ? d : o, small = big === d ? o : d, nv = big.vol + small.vol;
+        this.wobble(big, small.x - big.x, small.y - big.y, small.vol / nv);
         big.x = (big.x * big.vol + small.x * small.vol) / nv; big.y = (big.y * big.vol + small.y * small.vol) / nv; big.vol = nv; small.vol = 0;
       }
       for (let i = 0; i < M.length; i++) M[i] = 0;   // 沒落在水滴上的雨霧 → 太小、很快就乾了
@@ -470,7 +526,7 @@ class WetGlass {
     { let w = 0; const T = this.trails; for (let i = 0; i < T.length; i++) if (this.time - T[i].t0 < T[i].life) T[w++] = T[i]; T.length = w; }
     this.stepFog(dt);
     // 4. 水膜
-    this.stepFilm(dt, rain);
+    if (!frozen) this.stepFilm(dt, rain);   // 凍住的水膜（雨凇）不流
     // 5. 移除
     let w = 0; for (let i = 0; i < D.length; i++) if (D[i].vol > 0) D[w++] = D[i]; D.length = w;
   }
@@ -594,8 +650,9 @@ layout(location=2) in vec4 inst2;    // 半徑 m、seed、b = 離臨界多近（
 out vec2 vD; out vec4 vI;
 ${SHAPE}
 void main(){
-  float T, m; shape(inst2.w, inst2.z, T, m);
+  float T, m; shape(max(inst2.w, 0.0), inst2.z, T, m);
   vec2 d = vec2(corner.x * 1.4, mix(-1.35, max(1.75, T * 1.15), corner.y * 0.5 + 0.5));   // 留空間給下垂、歪斜、不規則的輪廓
+  if (inst2.w < 0.0) d *= 1.6;                                // 剛合併：被拉長
   vD = d; vI = inst2; gl_Position = vec4((inst.xy + d * inst.zw) * 2.0 - 1.0, 0.0, 1.0);
 }`;
 const stampFS = `#version 300 es
@@ -625,7 +682,7 @@ float hOf(vec2 p){
 }
 void main(){
   float r = vI.x, seed = vI.y, b = clamp(vI.z, 0.0, 1.0);
-  shape(vI.w, vI.z, gT, gM);
+  shape(max(vI.w, 0.0), vI.z, gT, gM);
   // 119012 實拍（放大看）：靜止的水滴幾乎沒有正圓 → 重力讓它上窄下寬、直向拉長 1.15~1.4 倍（像種子、淚滴），輪廓被髒污卡得不規則、稍微歪
   float s2 = fract(seed * 7.13), s3 = fract(seed * 13.7), s4 = fract(seed * 29.3);
   float sz = smoothstep(0.0003, 0.0016, r);                   // 越大越受重力影響、越不規則
@@ -633,6 +690,11 @@ void main(){
   gM = max(gM, sz * 0.22 * s3);                               // 上面窄一點但還是圓的（像蛋），不是尖的
   float tilt = (s4 - 0.5) * 0.42 * sz;                        // ±12°
   vec2 p = mat2(cos(tilt), sin(tilt), -sin(tilt), cos(tilt)) * vD;
+  if (vI.w < 0.0) {                                           // 剛合併：沿合併方向拉長、橫向變窄（花生形 → 縮回圓的）
+    float q = -vI.w - 1.0, ang = floor(q) / 89.99 * 3.14159265, e = fract(q) / 0.99;
+    vec2 ax = vec2(cos(ang), sin(ang)); float al = dot(vD, ax);
+    p = (vD - ax * al) * (1.0 + 0.25 * e) + ax * al / (1.0 + 0.6 * e);
+  }
   float az0 = atan(p.y, p.x);
   gW = 1.0 + (0.03 + 0.08 * sz) * (0.9 * sin(2.0 * az0 + seed * 6.28) + 0.7 * sin(3.0 * az0 + s2 * 17.0) + 0.4 * sin(5.0 * az0 + s3 * 23.0)) / 2.0;
   if (qOf(p) > 1.0) discard;
@@ -774,6 +836,7 @@ in vec2 vUV; out vec4 o;
 uniform sampler2D uScene, uL1, uL2, uL3, uDrop, uWet, uBg;
 uniform vec2 uGlass, uWetTexel; uniform vec4 uCover;
 uniform float uTime, uFloat, uDebug, uDropLod, uDropDefocus, uAspect, uFovK;
+uniform sampler2D uFrost, uFrostMask; uniform float uFrostP, uIceIn, uDropIce; uniform vec2 uFrostRes;
 ${COMMON}
 // 水滴看到的「世界」：畫面內 = 桌布（½～¼ 模糊層）；畫面外（168313：窄視角，水滴的廣角看到的大多在畫面外）
 //   往上超出 → 天空（上緣的平均再亮一點）；往下超出 → 地面（下緣的平均、很暗）；左右 → 鏡射延伸
@@ -823,6 +886,18 @@ void main(){
   // 起霧（玻璃裡面的凝結）：乳白、往局部平均提亮（Pilon 2021：小接觸角的霧往前散、幾乎不損失光）
   vec3 l2 = texture(uL2, uv).rgb, l3 = texture(uL3, uv).rgb;
   vec3 fogCol = mix(mix(l2, l3, 0.5), vec3(lum(l3)), 0.3) + (0.03 + lum(l3) * 0.45) * 0.4;
+  // 零下：霧珠變成冰（過冷的霧珠被冰橋一顆接一顆凍住，Dooley 2010／Paulovics 2022）
+  //   冰的飽和水氣比水低 → 冰花旁邊的霧珠蒸發、水氣跑到冰上（冰花四周一圈乾淨的玻璃）；冰花越長，霧被吃掉越多
+  if (uIceIn > 0.0) {
+    vec4 frL = textureLod(uFrost, uv, 3.0);
+    float nearIce = frL.g * clamp((uFrostP - (1.0 - frL.r) * 240.0) / 8.0, 0.0, 1.0) * texture(uFrostMask, uv).r;
+    float eat = max(smoothstep(0.015, 0.1, nearIce), clamp(uFrostP / 90.0, 0.0, 0.75));
+    vec2 gp = uv * uFrostRes;
+    float grain = 0.55 + 0.9 * (vn(gp * 0.9) * 0.6 + h1(floor(gp * 1.5)) * 0.4);   // 凍住的霧：一顆顆冰粒（不是均勻的乳白）
+    fog *= 1.0 - uIceIn * eat;
+    fog = mix(fog, fog * grain, uIceIn);
+    fogCol += uIceIn * 0.05;
+  }
   col = mix(col, fogCol, fog * 0.85);
   // 水滴（物理）：玻璃外面的球冠，接觸角 θ；從室內看出去，視線在水—空氣介面折射
   //   位置 ρ（0 中心～1 邊緣）的表面傾角 φ = asin(ρ·sinθ)；折射後偏 δ = asin(n·sinφ) − φ（上半部往下看、下半部往上看 → 上下顛倒）
@@ -876,7 +951,30 @@ void main(){
     vec3 defocused = l3 * 1.05 + 0.005;
     dc = mix(dc, defocused, uDropDefocus);
     dc = mix(dc, fogCol, fog * 0.18);       // 霧只把外面的水滴稍微洗淡
+    // 凍住的水滴：冰的折射率 1.31（跟水 1.33 差不多 → 還是透鏡），但凍的時候空氣被擠到中間 → 中心一團霧白的氣泡
+    if (uDropIce > 0.0) {
+      float core = (1.0 - rho * rho) * smoothstep(0.0004, 0.0012, r);
+      dc = mix(dc, l2 * 0.5 + vec3(0.88, 0.92, 0.97) * (0.1 + 0.6 * lum(l3)), uDropIce * 0.6 * core);
+      dc += uDropIce * step(0.985, h1(floor(uv * uFrostRes * 1.3))) * core * (0.2 + 0.8 * lum(l3));
+    }
     col = mix(col, dc, smoothstep(0.15, 0.65, a) * mix(1.0, 0.75, uDropDefocus));
+  }
+  // 冰花：在玻璃裡面（最靠近看的人）→ 蓋在外面的水滴上
+  //   冰針會散射：後面亮的地方（天空、燈、夕陽）冰花就亮、後面暗就只剩淡淡的灰白（246894：逆光的冰花最亮），冰晶的小面偶爾閃一下
+  if (uIceIn > 0.0) {
+    vec4 fr = texture(uFrost, uv);
+    float grown = step(0.003, fr.r) * clamp((uFrostP - (1.0 - fr.r) * 240.0) / 2.0, 0.0, 1.0);
+    float den = fr.g * grown * texture(uFrostMask, uv).r;
+    float eg = length(vec2(dFdx(den), dFdy(den)));
+    if (den > 0.002) {
+      float L = lum(l3);
+      vec3 behind = mix(col, l2, 0.6);
+      vec3 iceC = behind * 0.45 + vec3(0.88, 0.92, 0.97) * (0.2 + 0.75 * L);
+      iceC *= 1.0 - clamp(eg * 2.0, 0.0, 0.5) * (0.4 + L);       // 冰針的邊把光折走 → 細暗邊（亮背景前最明顯）
+      vec2 cid = floor(uv * uFrostRes);
+      iceC += step(0.993, h1(cid)) * (0.55 + 0.45 * sin(uTime * 1.7 + h1(cid + 3.1) * 40.0)) * (0.25 + 1.4 * L);
+      col = mix(col, iceC, clamp(den * 1.7, 0.0, 0.95));
+    }
   }
   if (uDebug > 0.5) {
     vec3 dbg = mix(vec3(5.0, 3.0, 56.0) / 255.0, vec3(95.0, 0.0, 62.0) / 255.0, clamp(w, 0.0, 1.0));
@@ -884,6 +982,67 @@ void main(){
   }
   o = vec4(col, 1.0);
 }`;
+
+// ---------- 窗上的冰花（蕨葉狀的霜，fern frost）----------
+//   成核點 = 玻璃上看不見的刮痕、凹洞、灰塵（atoptics）；下面比較冷（往下沉的冷空氣、窗框）→ 偏下、也從畫面外長進來
+//   沿六角冰晶的方向長：主幹（幾公分、慢慢彎）→ 左右交替 60° 的側枝（像羽毛，越靠尖端越短）→ 再分枝；碰到別根就停（水氣被搶走）
+//   枝與枝之間：凍住的小露珠（一顆顆小白點）（Pixabay 246894 實拍）
+//   畫成「什麼時候長到這裡」的圖：R = 1 − 時間 / FROST_TM、G = 密度（主幹最白）→ shader 用目前的進度當門檻，看起來就在長
+const FROST_TM = 240;
+function makeFrost(Wm, Hm, J) {
+  const FW = 540, FH = Math.round(FW * Hm / Wm), pxmm = FW / (Wm * 1000);
+  const cv = document.createElement("canvas"); cv.width = FW; cv.height = FH;
+  const g = cv.getContext("2d"); g.fillStyle = "#000"; g.fillRect(0, 0, FW, FH);
+  g.globalCompositeOperation = "lighten"; g.lineCap = "round";
+  const col = (t, den) => `rgb(${Math.max(1, Math.round(255 * (1 - t / FROST_TM)))},${Math.round(255 * den)},0)`;
+  const OC = 4, ow = Math.ceil(FW / OC) + 4, oh = Math.ceil(FH / OC) + 4, occ = new Int32Array(ow * oh).fill(-1);
+  const v = 1.0 * pxmm;                                        // 主幹 1 mm／秒（圖案時間）
+  const stack = []; let id = 0;
+  const nSeed = Math.round(9 + 9 * Math.min(1.5, J));          // 越冷、越濕：成核點越多、圖案越密
+  for (let k = 0; k < nSeed; k++) {
+    const e = Math.random(); let x, y;                          // y：0 = 玻璃下緣（跟模擬一樣往上為正）
+    if (e < 0.3) { x = Math.random() * FW; y = -3; }
+    else if (e < 0.42) { x = Math.random() < 0.5 ? -3 : FW + 3; y = Math.random() * FH * 0.6; }
+    else { x = Math.random() * FW; y = Math.pow(Math.random(), 1.25) * FH; }
+    const t0 = Math.random() * 30, a0 = e < 0.3 ? Math.PI / 2 + (Math.random() - 0.5) * 1.2 : Math.random() * Math.PI * 2, n = e < 0.42 ? 1 + (Math.random() * 2 | 0) : 2 + (Math.random() * 3 | 0);
+    for (let j = 0; j < n; j++) stack.push({ x, y, a: a0 + j * Math.PI / 3 * (n > 3 ? 1 : 2) + (Math.random() - 0.5) * 0.3, t: t0, L: (22 + 50 * Math.random()) * pxmm, lv: 0, id: id++ });
+  }
+  const W1 = [2.6, 1.5, 1.0], DEN = [1, 0.75, 0.55], SP = [1, 0.5, 0.35];
+  while (stack.length) {
+    const b = stack.pop(), lv = b.lv;
+    const step = lv === 0 ? 2 : lv === 1 ? Math.max(2, b.L / 3) : b.L;
+    let x = b.x, y = b.y, a = b.a, t = b.t, sd = 0, side = Math.random() < 0.5 ? 1 : -1;
+    let nextB = (lv === 0 ? 1.2 : 0.8) * pxmm * Math.random();
+    const curl = (Math.random() - 0.5) * 0.02;
+    while (sd < b.L - 0.01) {
+      const st = Math.min(step, b.L - sd), nx = x + Math.cos(a) * st, ny = y + Math.sin(a) * st;
+      if (nx < -10 || ny < -10 || nx > FW + 10 || ny > FH + 10) break;
+      t += st / (v * SP[lv]);
+      if (t > FROST_TM - 4) break;
+      const ci = (((ny / OC) | 0) + 2) * ow + ((nx / OC) | 0) + 2;
+      if (ci >= 0 && ci < occ.length) { if (occ[ci] >= 0 && occ[ci] !== b.id && Math.random() < 0.75) break; occ[ci] = b.id; }
+      g.strokeStyle = col(t, DEN[lv]); g.lineWidth = W1[lv] * (1 - 0.45 * sd / b.L);
+      g.beginPath(); g.moveTo(x, y); g.lineTo(nx, ny); g.stroke();
+      x = nx; y = ny; sd += st;
+      a += curl + (Math.random() - 0.5) * (lv === 0 ? 0.07 : 0.12);
+      if (lv < 2) while (sd > nextB && nextB < b.L) {
+        const bx = x - Math.cos(a) * (sd - nextB), by = y - Math.sin(a) * (sd - nextB), tb = t - (sd - nextB) / (v * SP[lv]);
+        side = -side;                                           // 左右交替（像羽毛）
+        const fall = 1 - nextB / b.L;                           // 越靠尖端越短
+        const Lb = (lv === 0 ? 3 + 6 * Math.random() : 0.9 + 2 * Math.random()) * pxmm * (0.3 + 0.7 * fall);
+        stack.push({ x: bx, y: by, a: a + side * (Math.PI / 3 + (Math.random() - 0.5) * 0.25), t: tb, L: Lb, lv: lv + 1, id: b.id });
+        if (lv === 0 && Math.random() < 0.05) stack.push({ x: bx, y: by, a: a + side * Math.PI / 3, t: tb, L: (b.L - nextB) * (0.5 + 0.4 * Math.random()), lv: 0, id: id++ });   // 分叉出另一根主幹
+        nextB += (lv === 0 ? 0.7 + 0.6 * Math.random() : 0.5 + 0.5 * Math.random()) * pxmm;
+      }
+    }
+  }
+  // 凍住的小露珠：枝與枝之間一顆顆的小白點
+  for (let k = 0; k < 2600 * Math.min(1.5, 0.5 + J); k++) {
+    const x = Math.random() * FW, y = Math.random() * FH, r = 0.4 + Math.random() * 0.8;
+    g.fillStyle = col(15 + Math.random() * 150, 0.25 + 0.3 * Math.random()); g.beginPath(); g.arc(x, y, r, 0, 6.2832); g.fill();
+  }
+  return cv;
+}
 
 // ---------- 時鐘數字的玻璃（小紅書 Next Vision：液態／凝態／霜態玻璃）----------
 //   數字的遮罩模糊後當成高度（一根根圓柱形的玻璃條）→ 法線 → 折射後面的畫面（雨、水滴都在裡面）
@@ -952,6 +1111,7 @@ void main(){
 }`;
 let pGlassC, uGl, clockMaskTex, clockHgtTex, clockKey = "", clockBox = [0.875, 0.47];
 let pTrail, trailVAO, trailBuf, uTr, pStamp, pComp, pBlur, pBokeh, pScene, pStreak, quadVAO, instVAO, instBuf, streakVAO, streakBuf;
+let frostTex, frostMaskTex, frostFor = null, frostRes = [1, 1], maskBytes;
 let fbo, dropTex, wetTex, bgTex, depthTex, uS, uC, uB, uK, uSc, uSt;
 const RT = {};        // 模糊層、散景、場景
 let glass, glassW = 0.07, glassH = 0.15, wetBytes;
@@ -973,7 +1133,7 @@ function setupGL() {
   pTrail = prog(trailVS, trailFS); uTr = uni(pTrail, ["uFloat", "uGlass"]);
   pGlassC = prog(quadVS, glassFS); uGl = uni(pGlassC, ["uImg", "uMask", "uHgt", "uKind", "uOn", "uAspect", "uTexel", "uBox", "uTone"]);
   clockMaskTex = gl.createTexture(); clockHgtTex = gl.createTexture();
-  uC = uni(pComp, ["uScene", "uL1", "uL2", "uL3", "uDrop", "uWet", "uBg", "uCover", "uGlass", "uWetTexel", "uTime", "uFloat", "uDebug", "uDropLod", "uDropDefocus", "uAspect", "uFovK"]);
+  uC = uni(pComp, ["uScene", "uL1", "uL2", "uL3", "uDrop", "uWet", "uBg", "uCover", "uGlass", "uWetTexel", "uTime", "uFloat", "uDebug", "uDropLod", "uDropDefocus", "uAspect", "uFovK", "uFrost", "uFrostMask", "uFrostP", "uIceIn", "uDropIce", "uFrostRes"]);
   uB = uni(pBlur, ["uSrc", "uStep", "uCover", "uUseCover"]);
   uK = uni(pBokeh, ["uSrc", "uCover", "uRad"]);
   uSc = uni(pScene, ["uBg", "uL1", "uL3", "uBk", "uDepth", "uCover", "uBlur", "uHaze", "uHasDepth", "uMaxDepth"]);
@@ -998,6 +1158,8 @@ function setupGL() {
   gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 0); gl.vertexAttribDivisor(1, 1);
   gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.FLOAT, false, 32, 16); gl.vertexAttribDivisor(2, 1);
   gl.bindVertexArray(null);
+  frostTex = gl.createTexture(); frostMaskTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, frostTex); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
   bgTex = gl.createTexture(); wetTex = gl.createTexture(); dropTex = gl.createTexture(); depthTex = gl.createTexture(); fbo = gl.createFramebuffer();
 }
 function makeDropTarget(w, h) {
@@ -1020,7 +1182,11 @@ function newGlass() {
   glass = new WetGlass(glassW, glassH);
   glass.rh = FOG_LEVELS[fogIdx].rh; glass.Tout = TEMPS[tempIdx]; glass.updateFogLevel(); glass.fog.fill(0); glass.initFog();
   // 一開始玻璃是乾的（使用者：「一開始是沒有雨在玻璃上的狀態」）→ 雨打上來才慢慢累積
-  wetBytes = new Uint8Array(glass.fw * glass.fh * 4);
+  wetBytes = new Uint8Array(glass.fw * glass.fh * 4); maskBytes = new Uint8Array(glass.fw * glass.fh * 4).fill(255);
+  gl.bindTexture(gl.TEXTURE_2D, frostMaskTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, glass.fw, glass.fh, 0, gl.RGBA, gl.UNSIGNED_BYTE, maskBytes);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   gl.bindTexture(gl.TEXTURE_2D, wetTex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, glass.fw, glass.fh, 0, gl.RGBA, gl.UNSIGNED_BYTE, wetBytes);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -1297,7 +1463,8 @@ function render(t, dt, rain) {
     inst[o] = d.x / glassW; inst[o + 1] = d.y / glassH;
     inst[o + 2] = r / glassW; inst[o + 3] = r / glassH;
     inst[o + 4] = r; inst[o + 5] = d.seed;
-    inst[o + 6] = r / (glass.slideRadius * glass.pinAt(d.x, d.y)); inst[o + 7] = d.moving ? d.v : 0;
+    inst[o + 6] = r / (glass.slideRadius * glass.pinAt(d.x, d.y));
+    inst[o + 7] = d.moving ? d.v : d.wob > 0 ? -(1 + Math.floor(((d.wa % Math.PI + Math.PI) % Math.PI) / Math.PI * 89.99) + 0.99 * d.we * Math.pow(d.wob / 0.25, 1.5)) : 0;   // 合併：−(1 + 方向 0~89 + 拉長 0~0.99)
     n++;
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -1334,15 +1501,30 @@ function render(t, dt, rain) {
   }
   gl.bindTexture(gl.TEXTURE_2D, wetTex);
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, glass.fw, glass.fh, gl.RGBA, gl.UNSIGNED_BYTE, wetBytes);
+  // ---- 3b. 冰花 ----
+  if (glass.frostP > 0 && frostFor !== glass) {
+    frostFor = glass;
+    const cv = makeFrost(glassW, glassH, Math.max(0.3, glass.iceFlux() / 0.019));
+    gl.bindTexture(gl.TEXTURE_2D, frostTex); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.generateMipmap(gl.TEXTURE_2D); frostRes = [cv.width, cv.height];
+  }
+  if (glass.frostP > 0) {
+    const M = glass.frostMask; for (let i = 0; i < M.length; i++) maskBytes[i * 4] = Math.round(255 * M[i]);
+    gl.bindTexture(gl.TEXTURE_2D, frostMaskTex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, glass.fw, glass.fh, gl.RGBA, gl.UNSIGNED_BYTE, maskBytes);
+  }
   // ---- 4. 合成 ----
   const glassOn = clockOn && CLOCK_GLASS[clockGlassIdx].kind > 0;
   if (glassOn) { buildClockMask(); gl.bindFramebuffer(gl.FRAMEBUFFER, RT.comp.fbo); }
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.useProgram(pComp);
-  const texs = [RT.scene.tex, RT.l1.tex, RT.l2.tex, RT.l3.tex, dropTex, wetTex, bgTex], names = ["uScene", "uL1", "uL2", "uL3", "uDrop", "uWet", "uBg"];
+  const texs = [RT.scene.tex, RT.l1.tex, RT.l2.tex, RT.l3.tex, dropTex, wetTex, bgTex, frostTex, frostMaskTex], names = ["uScene", "uL1", "uL2", "uL3", "uDrop", "uWet", "uBg", "uFrost", "uFrostMask"];
   for (let k = 0; k < texs.length; k++) { gl.activeTexture(gl.TEXTURE0 + k); gl.bindTexture(gl.TEXTURE_2D, texs[k]); gl.uniform1i(uC[names[k]], k); }
   gl.uniform2f(uC.uGlass, glassW, glassH); gl.uniform4f(uC.uCover, ...coverXform());
   gl.uniform2f(uC.uWetTexel, 1 / glass.fw, 1 / glass.fh);
+  gl.uniform1f(uC.uFrostP, glass.frostP); gl.uniform1f(uC.uIceIn, frostFor === glass ? Math.min(1, glass.frostP / 3) : 0); gl.uniform1f(uC.uDropIce, glass.iceOut); gl.uniform2f(uC.uFrostRes, frostRes[0], frostRes[1]);
   gl.uniform1f(uC.uTime, t); gl.uniform1f(uC.uFloat, floatOK ? 1 : 0); gl.uniform1f(uC.uDebug, debugOn ? 1 : 0);
   gl.uniform1f(uC.uDropLod, dropDefocus * 3.0); gl.uniform1f(uC.uDropDefocus, dropDefocus);
   gl.uniform1f(uC.uAspect, canvas.height / canvas.width);
@@ -1400,7 +1582,8 @@ let modeIdx = 0, clockOn = true, debugOn = false, weatherT = 0, last = 0, uiTime
 // 起霧、對焦（之前學的：雨窗外掛 Fog 預設 0.45；對焦在玻璃時背景失焦）
 const FOG_LEVELS = [{ rh: 0.6, v: 0.12, label: "濕度 60%" }, { rh: 0.75, v: 0.45, label: "濕度 75%" }, { rh: 0.9, v: 0.8, label: "濕度 90%" }, { rh: 0.45, v: 0, label: "濕度 45%" }];   // 室內濕度 → 霧的濃度、擦掉後多快回來（45% 低於露點：擦痕會乾掉）   // 預設 0.12 = 119012 那種清楚的窗
 let fogIdx = 0;
-const TEMPS = [12, 5, 20, 28];   // 室外氣溫（°C）：預設 12°C（秋天的雨）
+const TEMPS = [12, 5, 0, -5, -10, -20, 20, 28];   // 室外氣溫（°C）：預設 12°C（秋天的雨）；單層玻璃、室溫 22°C 時，室外約 −7°C 以下玻璃才會到零下
+const degC = v => `${v < -0.5 ? "−" : ""}${Math.abs(Math.round(v))}°C`;
 let tempIdx = 0;
 // 時鐘玻璃：實心（原本的白字）／液態／凝態／霜態（參考小紅書 Next Vision 的三種玻璃）
 const CLOCK_GLASS = [{ kind: 1, label: "液態玻璃" }, { kind: 2, label: "凝態玻璃" }, { kind: 3, label: "霜態玻璃" }, { kind: 0, label: "實心" }];
@@ -1436,7 +1619,7 @@ function showUI() { $("bar").classList.remove("hide"); clearTimeout(uiTimer); ui
 
 $("weather").addEventListener("click", () => { modeIdx = (modeIdx + 1) % MODES.length; $("weatherLabel").textContent = MODES[modeIdx].label; if (MODES[modeIdx].key === "video") { weatherT = 0; newGlass(); } showUI(); });
 $("focusBtn").addEventListener("click", () => { focus.target = focus.target > 0.5 ? 0 : 1; $("focusBtn").textContent = focus.target > 0.5 ? "對焦：玻璃" : "對焦：遠處"; showUI(); });
-$("tempBtn").addEventListener("click", () => { tempIdx = (tempIdx + 1) % TEMPS.length; glass.Tout = TEMPS[tempIdx]; $("tempBtn").textContent = `室外 ${TEMPS[tempIdx]}°C`; showUI(); });
+$("tempBtn").addEventListener("click", () => { tempIdx = (tempIdx + 1) % TEMPS.length; glass.Tout = TEMPS[tempIdx]; $("tempBtn").textContent = `室外 ${degC(TEMPS[tempIdx])}`; showUI(); });
 $("fogBtn").addEventListener("click", () => { fogIdx = (fogIdx + 1) % FOG_LEVELS.length; glass.rh = FOG_LEVELS[fogIdx].rh; $("fogBtn").textContent = FOG_LEVELS[fogIdx].label; showUI(); });
 $("glassBtn").addEventListener("click", () => { pickerOpen($("gpick").hidden); showUI(); });
 $("gpick").addEventListener("click", e => {
@@ -1471,7 +1654,7 @@ canvas.addEventListener("pointermove", e => {
   glass.wipe(wiping[0], wiping[1], p[0], p[1], 0.006 * VIEW_K); wiping = p;   // 手指在螢幕上的寬度不變
   $("hint").classList.add("gone");
 });
-canvas.addEventListener("pointerup", () => { if (wiping && moved < 0.002 && performance.now() - downAt < 350) { const b = $("bar"); if (b.classList.contains("hide")) showUI(); else { b.classList.add("hide"); pickerOpen(false); } } wiping = null; });
+canvas.addEventListener("pointerup", () => { if (wiping && moved >= 0.002) glass.wipeEnd(wiping[0], wiping[1]); if (wiping && moved < 0.002 && performance.now() - downAt < 350) { const b = $("bar"); if (b.classList.contains("hide")) showUI(); else { b.classList.add("hide"); pickerOpen(false); } } wiping = null; });
 canvas.addEventListener("pointercancel", () => { wiping = null; });
 
 // 存成影片：錄 12 秒（不含時鐘），可以設成動態桌布
@@ -1506,12 +1689,16 @@ function frame(now) {
   if (m.key === "auto") [rain, name, note] = autoRain(weatherT);
   else if (m.key === "video") { if (weatherT >= 53) { weatherT = 0; newGlass(); } [rain, name, note] = videoRain(weatherT); name = `影片 ${weatherT.toFixed(0)}／53 秒・${name}`; }
   else { rain = m.rain; name = m.label; note = m.key === "heavy" ? "水滴合併滑落，水膜從下面長上來" : m.key === "stop" ? "上面先乾，水膜破成一顆顆小水珠" : "小水滴慢慢合併、長大"; }
+  // 零下：−15°C 以下不會下雨（會是雪）；玻璃零下時打上來的是凍雨（過冷的雨滴一碰到就凍住）
+  if (glass.Tout <= -15) { rain = 0; name = "太冷了，不會下雨"; note = "這麼冷會下雪；玻璃外面的水滴都凍住了"; }
+  else if (glass.glassTemp() < 0 && rain > 0) { name = "凍雨・" + name; note = "過冷的雨滴一碰到零下的玻璃就凍住，不會滑"; }
   glass.step(dt, rain);
   // 拉焦：約 3.5 秒（之前學的：拉太快會「突然糊掉、閃一下」）
   focus.cur += Math.sign(focus.target - focus.cur) * Math.min(Math.abs(focus.target - focus.cur), dt / 3.5);
   render(now / 1000, dt, rain);
   const tg = glass.glassTemp(), td = glass.dewPoint();
-  if (!recording) $("status").innerHTML = `<b>${name}</b>${note ? "・" + note : ""}<br>玻璃 ${tg.toFixed(0)}°C・露點 ${td.toFixed(0)}°C・${tg < td ? "起霧" : "不起霧"}`;   // 看得出為什麼起霧
+  const line2 = tg < 0 ? `玻璃 ${degC(tg)}・${td > 0 ? "露點 " + degC(td) : "霜點 " + degC(glass.frostPoint())}・結霜（冰花約加快 30 倍長）` : `玻璃 ${degC(tg)}・露點 ${degC(td)}・${tg < td ? "起霧" : "不起霧"}`;
+  if (!recording) $("status").innerHTML = `<b>${name}</b>${note ? "・" + note : ""}<br>${line2}`;   // 看得出為什麼起霧
   requestAnimationFrame(frame);
 }
 
