@@ -210,6 +210,13 @@ class WetGlass {
     // 水路（Kaneda 1993）：滑過的地方已經濕了、接觸線不會被卡 → 後面的水滴優先走舊水路
     //   track = 濕過的記憶（約 40 秒才乾）；trails = 剛滑過留下的細水痕（一段段的細水柱，1~2 秒就變細、破成小水珠，Rio／Podgorski）
     this.track = new Float32Array(n); this.trails = []; this.time = 0;
+    // 灰塵（玻璃外面）：一塊塊、下面多（雨水濺上來、灰往下流），濕的時候看不見；水滴滑過、水膜流過會把它洗掉 → 下過雨的髒窗戶有一條條乾淨的水路
+    this.dust = new Float32Array(n);
+    { const ds = this.filmCell / 0.02;
+      for (let y = 0; y < this.fh; y++) for (let x = 0; x < this.fw; x++) {
+        const v = y / this.fh;
+        this.dust[y * this.fw + x] = clamp01(0.2 + 0.5 * vnoise(ox * 11 + x * ds, oy * 11 + y * ds) + 0.25 * (1 - v) * (1 - v));
+      } }
     // 冬天起霧的實拍（愛車褓母 EP12、俊辰說車 雨天前擋）：霧不是均勻的一片 → 一塊塊濃淡（玻璃各處冷熱、髒污、氣流不同），邊界很軟
     //   patch：3~6 cm 的大塊雜訊（濃的地方先起霧、霧也比較白）
     this.patch = new Float32Array(n);
@@ -304,6 +311,7 @@ class WetGlass {
         this.fogM[i] = m;
         this.cond[i] = Math.max(0, Math.min(12, this.cond[i] + Ji * dt));
         this.oil[i] *= ko; this.resid[i] *= kr;
+        if (this.film[i] > this.wetTh * 2) this.dust[i] *= 1 - dt * 0.03;   // 流動的水膜慢慢把灰沖掉
         const fv = (1 - Math.exp(-m / 1.0)) * (1 - 0.45 * this.oil[i]);
         this.fog[i] = fv * (1 - this.coat[i]); this.fogFilm[i] = fv * this.coat[i];
       }
@@ -341,13 +349,17 @@ class WetGlass {
         }
     return best;
   }
-  newDrop(x, y, vol, inside = false) { return { x, y, px: x, py: y, vol, v: 0, vx: 0, seed: Math.random(), dist: 0, lastBead: 0, moving: false, life: 0.5 + Math.random(), kick: 0, inside }; }
+  newDrop(x, y, vol, inside = false) { return { x, y, px: x, py: y, vol, v: 0, vx: 0, seed: Math.random(), dist: 0, lastBead: 0, moving: false, life: 0.5 + Math.random(), kick: 0, inside, age: 0, spl: 1, ox: 0, oy: 0 }; }
   impact(x, y, r) {
     if (x < 0 || y < 0 || x > this.W || y > this.H) return;
     const vol = V3(r);
     // 打在水膜上：先是一顆看得到的水滴，約 0.5~1.5 秒後才融進水膜（實拍：大雨時水膜上一直有新的水滴）
     const hit = this.overlap(x, y, r, -1);
-    if (hit >= 0) { const o = this.drops[hit], nv = o.vol + vol; this.wobble(o, x - o.x, y - o.y, vol / nv); if (!o.moving) { o.x = (o.x * o.vol + x * vol) / nv; o.y = (o.y * o.vol + y * vol) / nv; } o.vol = nv; return; }
+    if (hit >= 0) {
+      const o = this.drops[hit], nv = o.vol + vol, fr = vol / nv, x0 = o.x, y0 = o.y; this.wobble(o, x - o.x, y - o.y, fr);
+      if (fr > 0.04) { o.age = 0; o.spl = Math.min(0.8, 2.5 * fr); }                          // 打中的那一下：整顆被撞得攤開
+      if (!o.moving && fr > 0.05 && this.iceOut <= 0.02) o.y -= R3(vol) * (0.2 + 0.4 * Math.random());   // 雨滴的動量把它往下推一點
+      if (!o.moving) { o.x = (o.x * o.vol + x * vol) / nv; o.y = (o.y * o.vol + y * vol) / nv; o.ox = (o.ox || 0) + x0 - o.x; o.oy = (o.oy || 0) + y0 - o.y; } o.vol = nv; return; }
     const d = this.newDrop(x, y, vol);
     if (this.drops.length >= this.maxDrops) {
       let k = (Math.random() * this.drops.length) | 0;
@@ -374,7 +386,7 @@ class WetGlass {
   //   ratio = 小的那顆佔合併後的比例：毛毛雨落在大水滴上（< 4%）幾乎看不出來
   wobble(d, ax, ay, ratio) {
     if (ratio < 0.04 || d.moving || this.iceOut > 0.02) return;
-    d.wob = 0.25; d.wa = Math.atan2(ay, ax); d.we = Math.min(1, 1.6 * ratio);
+    d.wob = 0.35; d.wa = Math.atan2(ay, ax); d.we = Math.min(1, 1.6 * ratio);
     d.kick = Math.max(d.kick || 0, 0.15); d.kickD = 0.62 + 0.22 * Math.random();
   }
   seed(n, r0, r1) { this.buildGrid(); for (let i = 0; i < n; i++) { const u = Math.random(); this.impact(Math.random() * this.W, Math.random() * this.H, r0 + (r1 - r0) * u * u); } }   // 小的多、大的少
@@ -415,6 +427,7 @@ class WetGlass {
         if (((x - fx) ** 2 + (y - fy) ** 2) > rc * rc) continue;
         const i = y * this.fw + x;
         this.film[i] *= 0.2;                       // 外面的水膜被抹掉
+        this.dust[i] *= 0.35;                      // 手指把灰也擦掉了
         this.resid[i] = 0.75 + 0.25 * Math.random(); this.wdir[i] = ang;   // 指紋的細紋（極薄的水膜，幾秒就乾）
         cond += this.cond[i]; this.cond[i] = 0;    // 霧裡的水
         if (this.frostP > 0) { this.frostMask[i] = 0; this.maskLow = true; }   // 冰花被刮掉
@@ -465,6 +478,8 @@ class WetGlass {
       const d = D[i]; if (d.vol <= 0) continue;
       if (d.kick > 0 && !d.moving) d.kick -= dt;
       if (d.wob > 0) d.wob -= dt;
+      d.age = (d.age || 0) + dt;
+      if (d.ox || d.oy) { const k = Math.exp(-dt / 0.06); d.ox *= k; d.oy *= k; if (Math.abs(d.ox) + Math.abs(d.oy) < 1e-6) d.ox = d.oy = 0; }
       const r = R3(d.vol);
       if (frozen) { d.moving = false; d.v = 0; continue; }
       if (!d.moving) {
@@ -486,7 +501,7 @@ class WetGlass {
       d.px = d.x; d.py = d.y;
       const ds = d.v * dt;
       const pl = this.pinAt(d.x - r * 1.2, d.y - r) + this.pinAt(d.x - r * 2.2, d.y - r * 1.5), pr = this.pinAt(d.x + r * 1.2, d.y - r) + this.pinAt(d.x + r * 2.2, d.y - r * 1.5);   // 往下看左右兩邊：哪邊有舊水路（比較好滑）就往哪邊偏
-      const lat = Math.max(-0.3, Math.min(0.3, (pl - pr) * 0.8 + (vnoise(d.seed * 50, d.dist * 70) - 0.5) * 0.5));
+      const lat = Math.max(-0.45, Math.min(0.45, (pl - pr) * 1.1 + (vnoise(d.seed * 50, d.dist * 70) - 0.5) * 0.7));   // 髒污、舊水路讓路線左右歪（比之前歪 1.5 倍）
       d.vx += (lat - d.vx) * Math.min(1, dt / 0.15);
       d.x += sideX * d.vx * ds; d.y += gy * ds;
       d.dist += ds;
@@ -509,6 +524,7 @@ class WetGlass {
       if (hit >= 0 && hit !== i) {
         const o = D[hit], nv = d.vol + o.vol;
         d.x = (d.x * d.vol + o.x * o.vol) / nv; d.y = Math.min(d.y, o.y);   // 不會被往上拉
+        d.v *= d.vol / nv;                                         // 動量守恆：吃到一顆靜止的就頓一下
         d.vol = nv; o.vol = 0;
       }
       if (d.moving && R3(d.vol) > this.blobRadius) { this.spreadFilm(d.x, d.y, R3(d.vol) * 1.5, d.vol); d.vol = 0; }   // 大到攤成一灘
@@ -543,7 +559,9 @@ class WetGlass {
         const o = D[j]; if (o.vol <= 0) continue;
         const big = d.vol >= o.vol ? d : o, small = big === d ? o : d, nv = big.vol + small.vol;
         this.wobble(big, small.x - big.x, small.y - big.y, small.vol / nv);
+        const bx0 = big.x, by0 = big.y;
         big.x = (big.x * big.vol + small.x * small.vol) / nv; big.y = (big.y * big.vol + small.y * small.vol) / nv; big.vol = nv; small.vol = 0;
+        big.ox = (big.ox || 0) + bx0 - big.x; big.oy = (big.oy || 0) + by0 - big.y;   // 畫面上：大的那顆的水慢慢流向新的中心（不是瞬間跳過去）
       }
       for (let i = 0; i < M.length; i++) M[i] = 0;   // 沒落在水滴上的雨霧 → 太小、很快就乾了
       for (let i = 0; i < M.length; i++) if (false) {
@@ -573,6 +591,7 @@ class WetGlass {
         const i = this.fIdx(x + k * half, y), v = k ? 0.6 : 1;
         if (this.track[i] < v) this.track[i] = v;
       }
+      for (let k = -1; k <= 1; k++) this.dust[this.fIdx(x + k * r * 0.7, y - r * 0.5)] *= 0.6;   // 水滴整個寬度滑過 → 灰被帶走
     }
   }
   spreadFilm(cx, cy, rad, vol) {
@@ -922,6 +941,18 @@ void main(){
   // 霧珠把光往四面八方散：看到的是一大片周圍光的平均（l3），再加上室內的光被霧打回來（白天、夜裡都有一層灰白）
   //   實拍（俊辰說車 前擋）：深色的樹 0.3 → 起霧後約 0.65、天空 0.85 幾乎不變 → 暗處被提亮很多、顏色變淡、偏一點冷色
   vec3 fogCol = mix(l3, vec3(lum(l3)), 0.4) * 0.78 * vec3(0.97, 0.99, 1.03) + 0.15 + 0.14 * lum(l3);
+  // 灰塵與水垢（玻璃外面，乾的地方才看得到）：細顆粒的灰 ＋ 以前的雨乾掉留下的一圈圈水垢（礦物留在接觸線上：咖啡圈效應）
+  {
+    float dv = texture(uFrostMask, uv).b;
+    vec2 mm = uv * uGlass * 1000.0;                              // 玻璃上的位置（mm）
+    vec2 ci = floor(mm / 2.6), fc = fract(mm / 2.6) - 0.5 - (vec2(h1(ci), h1(ci + 5.1)) - 0.5) * 0.5;
+    float rad = 0.12 + 0.2 * h1(ci + 2.3);
+    float ring = smoothstep(0.035, 0.0, abs(length(fc * vec2(1.0, 0.85)) - rad)) * step(0.5, h1(ci + 9.7));
+    float grain = 0.55 + 0.9 * vn(mm / 0.35) * vn(mm / 1.7 + 3.0);
+    float dd = dv * (0.7 * grain + 1.3 * ring);
+    vec3 dustCol = l2 * 0.8 + 0.08 + 0.36 * lum(l3);              // 灰把光散開：背景亮的地方灰也亮
+    col = mix(col, dustCol, clamp(dd * 0.38, 0.0, 0.45));
+  }
   // 防霧塗層：親水 → 凝結的水攤成一層連續的薄水膜（不散射、透明），只有厚薄不均的地方稍微扭曲
   {
     float film = texture(uFrostMask, uv).g;
@@ -1226,7 +1257,7 @@ function newGlass() {
   glass = new WetGlass(glassW, glassH);
   glass.rh = FOG_LEVELS[fogIdx].rh; glass.Tout = TEMPS[tempIdx]; glass.defogOn = defogOn; glass.setCoat(coatOn); glass.updateFogLevel(); glass.fog.fill(0); glass.initFog();
   // 一開始玻璃是乾的（使用者：「一開始是沒有雨在玻璃上的狀態」）→ 雨打上來才慢慢累積
-  wetBytes = new Uint8Array(glass.fw * glass.fh * 4); maskBytes = new Uint8Array(glass.fw * glass.fh * 4).fill(255); for (let i = 1; i < maskBytes.length; i += 4) maskBytes[i] = 0;
+  wetBytes = new Uint8Array(glass.fw * glass.fh * 4); maskBytes = new Uint8Array(glass.fw * glass.fh * 4).fill(255); for (let i = 1; i < maskBytes.length; i += 4) maskBytes[i] = maskBytes[i + 1] = 0;
   gl.bindTexture(gl.TEXTURE_2D, frostMaskTex);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, glass.fw, glass.fh, 0, gl.RGBA, gl.UNSIGNED_BYTE, maskBytes);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -1503,12 +1534,21 @@ function render(t, dt, rain) {
   let n = 0;
   for (const d of order) {
     if (n >= 6100) break;
-    const r = R3(d.vol), o = n * 8;
-    inst[o] = d.x / glassW; inst[o + 1] = d.y / glassH;
+    const r0 = R3(d.vol), o = n * 8;
+    // 雨打上來（或打在水滴上）的那一下：先攤成一片再縮回（實際約幾毫秒，畫面上留 1~3 格）
+    const sp = d.age < 0.05 ? 1 + 0.9 * (d.spl ?? 1) * (1 - d.age / 0.05) ** 2 : 1, r = r0 * sp;
+    inst[o] = (d.x + (d.ox || 0)) / glassW; inst[o + 1] = (d.y + (d.oy || 0)) / glassH;
     inst[o + 2] = r / glassW; inst[o + 3] = r / glassH;
     inst[o + 4] = r; inst[o + 5] = d.seed;
-    inst[o + 6] = r / (glass.slideRadius * glass.pinAt(d.x, d.y));
-    inst[o + 7] = d.moving ? d.v : d.wob > 0 ? -(1 + Math.floor(((d.wa % Math.PI + Math.PI) % Math.PI) / Math.PI * 89.99) + 0.99 * d.we * Math.pow(d.wob / 0.25, 1.5)) : 0;   // 合併：−(1 + 方向 0~89 + 拉長 0~0.99)
+    inst[o + 6] = r0 / (glass.slideRadius * glass.pinAt(d.x, d.y));
+    // 合併後：阻尼振盪（毫米水滴的毛細振盪週期 ∝ √(ρR³/σ)，約 0.03~0.12 秒），先沿合併方向拉長、再往橫的方向回彈，越來越小
+    let wv = 0;
+    if (!d.moving && d.wob > 0) {
+      const t = 0.35 - d.wob, T = Math.min(0.12, Math.max(0.03, 0.06 * Math.pow(r0 / 0.0015, 1.5)));
+      const osc = d.we * Math.exp(-t / 0.12) * Math.cos(2 * Math.PI * t / T), ang = d.wa + (osc < 0 ? Math.PI / 2 : 0);
+      wv = -(1 + Math.floor(((ang % Math.PI + Math.PI) % Math.PI) / Math.PI * 89.99) + 0.99 * Math.min(1, Math.abs(osc)));   // −(1 + 方向 0~89 + 拉長 0~0.99)
+    }
+    inst[o + 7] = d.moving ? d.v : wv;
     n++;
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -1556,7 +1596,8 @@ function render(t, dt, rain) {
     gl.generateMipmap(gl.TEXTURE_2D); frostRes = [cv.width, cv.height];
   }
   {
-    const M = glass.frostMask, FF = glass.fogFilm; for (let i = 0; i < M.length; i++) { maskBytes[i * 4] = Math.round(255 * M[i]); maskBytes[i * 4 + 1] = Math.round(255 * clamp01(FF[i])); }
+    const M = glass.frostMask, FF = glass.fogFilm; for (let i = 0; i < M.length; i++) { maskBytes[i * 4] = Math.round(255 * M[i]); maskBytes[i * 4 + 1] = Math.round(255 * clamp01(FF[i]));
+      const wet = Math.max(clamp01(glass.film[i] / glass.wetTh), glass.track[i]); maskBytes[i * 4 + 2] = Math.round(255 * glass.dust[i] * (1 - wet)); }
     gl.bindTexture(gl.TEXTURE_2D, frostMaskTex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, glass.fw, glass.fh, gl.RGBA, gl.UNSIGNED_BYTE, maskBytes);
   }
   // ---- 4. 合成 ----
